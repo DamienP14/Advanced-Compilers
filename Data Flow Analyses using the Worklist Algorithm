@@ -1,0 +1,289 @@
+# Reads Bril JSON on stdin. Usage:
+#   bril2json < prog.bril | python3 dataflow.py rd
+#   bril2json < prog.bril | python3 dataflow.py ae
+#
+# Outputs IN/OUT sets per basic block in a stable, human-friendly form.
+
+import json, sys
+from collections import defaultdict, deque
+
+COMMUTATIVE = {"add","mul","and","or","xor","eq"}  # treat these as a∘b == b∘a
+BINOPS = {"add","sub","mul","div","eq","lt","gt","le","ge","and","or","xor"}
+
+# ---------- Bril helpers ----------
+
+def parse_func(prog):
+    """Return the first function (or the one named main if present)."""
+    funs = prog["functions"]
+    byname = {f["name"]: f for f in funs}
+    if "main" in byname:
+        return byname["main"]
+    return funs[0]
+
+def split_blocks(fn):
+    """
+    Split function into basic blocks and build a CFG.
+    Returns:
+      blocks: list of block names
+      instrs: dict block -> list of instrs (each instr keeps original dict)
+      preds, succs: dict block -> list of block names
+      order: list of block names in layout order
+    """
+    # Assign a label to any position that starts a block.
+    labels = {}
+    for i,ins in enumerate(fn["instrs"]):
+        if "label" in ins:
+            labels[ins["label"]] = i
+
+    # Find block boundaries
+    starts = set()
+    idxs = list(range(len(fn["instrs"])))
+    def is_term(ins):
+        op = ins.get("op")
+        return op in {"br","jmp","ret"}
+
+    # first instruction starts a block (unless it's a label; we’ll capture that)
+    if idxs:
+        starts.add(0)
+    # any label starts a block
+    for i,ins in enumerate(fn["instrs"]):
+        if "label" in ins:
+            starts.add(i)
+        # instruction after a terminator starts a block
+        if is_term(ins) and i+1 < len(fn["instrs"]):
+            starts.add(i+1)
+
+    starts = sorted(starts)
+    # build blocks
+    name_of = {}
+    blocks = []
+    instrs = {}
+    for si, s in enumerate(starts):
+        e = starts[si+1] if si+1 < len(starts) else len(fn["instrs"])
+        chunk = fn["instrs"][s:e]
+        # name the block by its first label if any; otherwise synthesize
+        bname = None
+        for ins in chunk:
+            if "label" in ins:
+                bname = ins["label"]
+                break
+        if bname is None:
+            bname = f".b{si}"
+        name_of[s] = bname
+        blocks.append(bname)
+        instrs[bname] = [ins for ins in chunk if "label" not in ins]
+
+    # successors (fallthrough/branches)
+    succs = {b: [] for b in blocks}
+    preds = {b: [] for b in blocks}
+    for i, b in enumerate(blocks):
+        last = instrs[b][-1] if instrs[b] else None
+        if last and last.get("op") == "br":
+            for L in last["labels"]:
+                succs[b].append(L)
+        elif last and last.get("op") == "jmp":
+            succs[b].append(last["labels"][0])
+        elif last and last.get("op") == "ret":
+            pass
+        else:
+            if i+1 < len(blocks):
+                succs[b].append(blocks[i+1])
+        # record preds
+    for b in blocks:
+        for s in succs[b]:
+            preds[s].append(b)
+
+    return blocks, instrs, preds, succs
+
+# ---------- Reaching Definitions (RD) ----------
+
+def rd_analysis(blocks, instrs, preds, succs):
+    """
+    Forward 'may' analysis on sets of definition ids.
+    A definition id is (block, index_in_block).
+    """
+    # give every assignment a unique def_id + record var
+    all_defs_of = defaultdict(set)   # var -> {def_ids}
+    def_of_stmt = {}                 # def_id -> var
+    for b in blocks:
+        for i, ins in enumerate(instrs[b]):
+            if "dest" in ins:
+                did = (b, i)
+                v = ins["dest"]
+                def_of_stmt[did] = v
+                all_defs_of[v].add(did)
+
+    GEN = {b:set() for b in blocks}
+    KILL = {b:set() for b in blocks}
+
+    # within-block: keep only the last def of each var in GEN
+    for b in blocks:
+        last = {}
+        for i, ins in enumerate(instrs[b]):
+            if "dest" in ins:
+                v = ins["dest"]
+                did = (b, i)
+                # overwrite earlier def of v in this block
+                if v in last:
+                    GEN[b].discard(last[v])
+                last[v] = did
+                GEN[b].add(did)
+        # kills: for every var defined in this block, kill all other defs
+        for v, did in last.items():
+            KILL[b].update(all_defs_of[v] - {did})
+
+    IN  = {b:set() for b in blocks}
+    OUT = {b:set(GEN[b]) for b in blocks}  # IN starts empty
+
+    W = deque(blocks)
+    while W:
+        b = W.popleft()
+        new_in = set().union(*[OUT[p] for p in preds[b]]) if preds[b] else set()
+        new_out = GEN[b] | (new_in - KILL[b])
+        if new_in != IN[b] or new_out != OUT[b]:
+            IN[b], OUT[b] = new_in, new_out
+            for s in succs[b]:
+                W.append(s)
+
+    return IN, OUT, GEN, KILL
+
+# ---------- Available Expressions (AE) ----------
+
+def canon_expr(op, a, b):
+    if op in COMMUTATIVE and a > b:
+        a, b = b, a
+    return (op, a, b)
+
+def expr_vars(expr):
+    _, a, b = expr
+    vs = set()
+    if not a.startswith("#"): vs.add(a)
+    if not b.startswith("#"): vs.add(b)
+    return vs
+
+def ae_universe(blocks, instrs):
+    U = set()
+    for b in blocks:
+        for ins in instrs[b]:
+            op = ins.get("op")
+            if op in BINOPS and len(ins.get("args",[])) == 2:
+                a, b2 = ins["args"]
+                # mark constants so they don't interact with kills
+                if isinstance(a,(int,float)): a = f"#{a}"
+                if isinstance(b2,(int,float)): b2 = f"#{b2}"
+                U.add(canon_expr(op, str(a), str(b2)))
+    return U
+
+def ae_analysis(blocks, instrs, preds, succs):
+    """
+    Forward 'must' analysis on sets of expressions.
+    Universe U = all binary expressions in the function.
+    IN[entry]=∅, IN[others]=U ; merge=intersection ; transfer: OUT=GEN ∪ (IN−KILL)
+    """
+    U = ae_universe(blocks, instrs)
+
+    # DEF vars per block
+    DEF = {b:set() for b in blocks}
+    for b in blocks:
+        for ins in instrs[b]:
+            if "dest" in ins:
+                DEF[b].add(ins["dest"])
+
+    # KILL: any expression mentioning a var we define in this block
+    KILL = {b:set() for b in blocks}
+    for b in blocks:
+        killset = set()
+        for e in U:
+            vs = expr_vars(e)
+            if vs & DEF[b]:
+                killset.add(e)
+        KILL[b] = killset
+
+    # GEN: expressions computed in b and not killed later in b
+    GEN = {b:set() for b in blocks}
+    for b in blocks:
+        avail = set()
+        for ins in instrs[b]:
+            op = ins.get("op")
+            # if we compute an expression, add it first
+            if op in BINOPS and len(ins.get("args",[])) == 2:
+                a, c = ins["args"]
+                if isinstance(a,(int,float)): a = f"#{a}"
+                if isinstance(c,(int,float)): c = f"#{c}"
+                e = canon_expr(op, str(a), str(c))
+                avail.add(e)
+            # any definition kills expressions that mention the dest var
+            if "dest" in ins:
+                v = ins["dest"]
+                avail = {e for e in avail if v not in expr_vars(e)}
+        GEN[b] = avail
+
+    # Initialize IN: entry is ∅, others U (must analysis)
+    entry = blocks[0]
+    IN  = {b:set(U) for b in blocks}
+    IN[entry] = set()
+    OUT = {b:set() for b in blocks}
+
+    W = deque(blocks)
+    while W:
+        b = W.popleft()
+        # meet over predecessors: intersection
+        if preds[b]:
+            new_in = set(U)
+            for p in preds[b]:
+                new_in &= OUT[p]
+        else:
+            new_in = IN[b]  # entry keeps its special ∅
+        new_out = GEN[b] | (new_in - KILL[b])
+        if new_in != IN[b] or new_out != OUT[b]:
+            IN[b], OUT[b] = new_in, new_out
+            for s in succs[b]:
+                W.append(s)
+
+    return IN, OUT, GEN, KILL, U
+
+# ---------- Printing ----------
+
+def fmt_defs(s):
+    # def ids sorted by (block, idx) -> "b:i"
+    xs = [f"{b}:{i}" for (b,i) in sorted(s)]
+    return "{" + ", ".join(xs) + "}"
+
+def fmt_exprs(s):
+    def show(e):
+        op,a,b = e
+        return f"{a} {op} {b}"
+    xs = sorted([show(e) for e in s])
+    return "{" + ", ".join(xs) + "}"
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in {"rd","ae"}:
+        print("Usage: dataflow.py [rd|ae]", file=sys.stderr)
+        sys.exit(2)
+    mode = sys.argv[1]
+    prog = json.load(sys.stdin)
+    fn = parse_func(prog)
+    blocks, instrs, preds, succs = split_blocks(fn)
+
+    if mode == "rd":
+        IN, OUT, GEN, KILL = rd_analysis(blocks, instrs, preds, succs)
+        print("== Reaching Definitions ==")
+        for b in blocks:
+            print(f"[{b}]")
+            print(f"  GEN  = {fmt_defs(GEN[b])}")
+            print(f"  KILL = {fmt_defs(KILL[b])}")
+            print(f"  IN   = {fmt_defs(IN[b])}")
+            print(f"  OUT  = {fmt_defs(OUT[b])}")
+    else:
+        IN, OUT, GEN, KILL, U = ae_analysis(blocks, instrs, preds, succs)
+        print("== Available Expressions ==")
+        print(f"Universe U = {fmt_exprs(U)}")
+        for b in blocks:
+            print(f"[{b}]")
+            print(f"  GEN  = {fmt_exprs(GEN[b])}")
+            print(f"  KILL = {fmt_exprs(KILL[b])}")
+            print(f"  IN   = {fmt_exprs(IN[b])}")
+            print(f"  OUT  = {fmt_exprs(OUT[b])}")
+
+if __name__ == "__main__":
+    main()
