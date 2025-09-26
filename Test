@@ -1,0 +1,119 @@
+@main {
+  a: int = const 1;
+  b: int = const 2;
+  c: int = add a b;
+  a: int = const 3;
+  d: int = add a b;
+  print d;
+}
+
+== Reaching Definitions ==
+[.b0]
+  GEN  = {.b0:0, .b0:1, .b0:2, .b0:3, .b0:4, .b0:5}
+  KILL = {}
+  IN   = {}
+  OUT  = {.b0:0, .b0:1, .b0:2, .b0:3, .b0:4, .b0:5}
+
+
+@main {
+entry:
+  a: int = const 1;
+  b: int = const 2;
+  c: bool = const true;
+  br c then else;
+then:
+  a: int = const 10;
+  jmp join;
+else:
+  a: int = const 20;
+  jmp join;
+join:
+  d: int = add a b;
+  print d;
+}
+
+== Reaching Definitions ==
+[entry]
+  GEN  = {entry:0, entry:1, entry:2}
+  KILL = {}
+  IN   = {}
+  OUT  = {entry:0, entry:1, entry:2}
+[then]
+  GEN  = {then:0}
+  KILL = {entry:0, else:0}
+  IN   = {entry:0, entry:1, entry:2}
+  OUT  = {entry:1, entry:2, then:0}
+[else]
+  GEN  = {else:0}
+  KILL = {entry:0, then:0}
+  IN   = {entry:0, entry:1, entry:2}
+  OUT  = {entry:1, entry:2, else:0}
+[join]
+  GEN  = {join:0, join:1}
+  KILL = {}
+  IN   = {entry:1, then:0, else:0, entry:2}
+  OUT  = {entry:1, then:0, else:0, entry:2, join:0, join:1}
+
+
+
+@main {
+entry:
+  a: int = const 1;
+  b: int = const 2;
+  c: bool = const true;
+  br c L1 L2;
+L1:
+  t1: int = add a b;
+  jmp J;
+L2:
+  t2: int = add a b;
+  jmp J;
+J:
+  u: int = add a b;   # should be available on all paths
+  print u;
+}
+
+
+== Available Expressions ==
+Universe U = {a add b}
+[entry]
+  GEN  = {}
+  KILL = {}
+  IN   = {}
+  OUT  = {}
+[L1]
+  GEN  = {a add b}
+  KILL = {}
+  IN   = {}
+  OUT  = {a add b}
+[L2]
+  GEN  = {a add b}
+  KILL = {}
+  IN   = {}
+  OUT  = {a add b}
+[J]
+  GEN  = {a add b}
+  KILL = {}
+  IN   = {a add b}
+  OUT  = {a add b}
+
+
+@main {
+  a: int = const 1;
+  b: int = const 2;
+  t: int = add a b;   # (a+b) available here
+  a: int = const 9;   # kills any expr containing a
+  u: int = add a b;   # must recompute
+  print u;
+}
+
+
+== Available Expressions ==
+Universe U = {a add b}
+[.b0]
+  GEN  = {a add b}
+  KILL = {a add b}
+  IN   = {}
+  OUT  = {}
+
+
